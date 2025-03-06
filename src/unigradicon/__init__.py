@@ -1,21 +1,28 @@
 import itk
 import os
+from collections import namedtuple
 from datetime import datetime
 
 import footsteps
 import numpy as np
 import torch
-import torch.nn.functional as F
+
+from monai.losses import DiceLoss
+from monai.networks.utils import one_hot
 
 import icon_registration as icon
 import icon_registration.network_wrappers as network_wrappers
 import icon_registration.networks as networks
 from icon_registration import config
-from icon_registration.losses import ICONLoss, to_floats
 from icon_registration.mermaidlite import compute_warped_image_multiNC
 import icon_registration.itk_wrapper
 
 input_shape = [1, 1, 175, 175, 175]
+
+ICONLossExt = namedtuple(
+    "ICONLossExt",
+    "all_loss inverse_consistency_loss similarity_loss dice_loss transform_magnitude flips",
+)
 
 class GradientICONSparse(network_wrappers.RegistrationModule):
     def __init__(self, network, similarity, lmbda, use_label=False):
@@ -26,8 +33,11 @@ class GradientICONSparse(network_wrappers.RegistrationModule):
         self.lmbda = lmbda
         self.similarity = similarity
         self.use_label = use_label
+        self.dice = DiceLoss(include_background=False, reduction="mean")
 
     def forward(self, image_A, image_B, label_A=None, label_B=None):
+        if not self.use_label:
+            seg_A, seg_B = label_A, label_B
 
         assert self.identity_map.shape[2:] == image_A.shape[2:]
         assert self.identity_map.shape[2:] == image_B.shape[2:]
@@ -79,6 +89,18 @@ class GradientICONSparse(network_wrappers.RegistrationModule):
             1,
             zero_boundary=True
         )
+        dice_loss = torch.asarray([0.0], device=image_A.device)
+        if seg_A is not None:
+            warped_seg_A = compute_warped_image_multiNC(
+                torch.cat([seg_A, inbounds_tag], axis=1) if inbounds_tag is not None else seg_A,
+                self.phi_AB_vectorfield,
+                self.spacing,
+                spline_order=0,
+            )
+            num_classes = 38 # TODO: should not be hardcoded
+            dice_loss = self.dice(
+                one_hot(warped_seg_A, num_classes=num_classes), 
+                one_hot(seg_B, num_classes=num_classes))
         
         if self.use_label:
             self.warped_label_A = compute_warped_image_multiNC(
@@ -150,15 +172,16 @@ class GradientICONSparse(network_wrappers.RegistrationModule):
 
         inverse_consistency_loss = sum(direction_losses)
 
-        all_loss = self.lmbda * inverse_consistency_loss + similarity_loss
+        all_loss = self.lmbda * inverse_consistency_loss + similarity_loss + 0.1 * dice_loss
 
         transform_magnitude = torch.mean(
             (self.identity_map - self.phi_AB_vectorfield) ** 2
         )
-        return icon.losses.ICONLoss(
+        return ICONLossExt(
             all_loss,
             inverse_consistency_loss,
             similarity_loss,
+            dice_loss,
             transform_magnitude,
             icon.losses.flips(self.phi_BA_vectorfield),
         )
@@ -229,13 +252,22 @@ def get_unigradicon(loss_fn=icon.LNCC(sigma=5)):
     net.eval()
     return net
 
+def get_other(model_path, loss_fn=icon.LNCC(sigma=5)):
+    net = make_network(input_shape, include_last_step=True, loss_fn=loss_fn)
+    trained_weights = torch.load(model_path, map_location=torch.device("cpu"), weights_only=True)
+    net.regis_net.load_state_dict(trained_weights)
+    net.to(config.device)
+    net.eval()
+    return net
+
 def get_model_from_model_zoo(model_name="unigradicon", loss_fn=icon.LNCC(sigma=5)):
     if model_name == "unigradicon":
         return get_unigradicon(loss_fn)
     elif model_name == "multigradicon":
         return get_multigradicon(loss_fn)
     else:
-        raise ValueError(f"Model {model_name} not recognized. Choose from [unigradicon, multigradicon].")
+        return get_other(model_name, loss_fn)
+        #raise ValueError(f"Model {model_name} not recognized. Choose from [unigradicon, multigradicon].")
 
 def quantile(arr: torch.Tensor, q):
     arr = arr.flatten()
