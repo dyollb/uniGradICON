@@ -15,7 +15,8 @@ import icon_registration.network_wrappers as network_wrappers
 import icon_registration.networks as networks
 from icon_registration import config
 from icon_registration.mermaidlite import compute_warped_image_multiNC
-import icon_registration.itk_wrapper
+
+import unigradicon.itk_wrapper
 
 input_shape = [1, 1, 175, 175, 175]
 
@@ -321,11 +322,11 @@ def main():
                          type=str, help="The modality of the fixed image. Should be 'ct' or 'mri'.")
     parser.add_argument("--moving_modality", required=True,
                          type=str, help="The modality of the moving image. Should be 'ct' or 'mri'.")
-    parser.add_argument("--fixed_segmentation", required=False,
-                         type=str, help="The path of the segmentation map of the fixed image. \
+    parser.add_argument("--fixed_mask", required=False,
+                         type=str, help="The path of the mask of the fixed image. \
                          This map will be applied to the fixed image before registration.")
-    parser.add_argument("--moving_segmentation", required=False,
-                         type=str, help="The path of the segmentation map of the moving image. \
+    parser.add_argument("--moving_mask", required=False,
+                         type=str, help="The path of the mask of the moving image. \
                          This map will be applied to the moving image before registration.")
     parser.add_argument("--transform_out", required=True,
                          type=str, help="The path to save the transform.")
@@ -337,6 +338,12 @@ def main():
                          default="lncc", help="The similarity measure used in IO. Default is LNCC. Choose from [lncc, lncc2, mind].")
     parser.add_argument("--model", required=False,
                          default="unigradicon", help="The model to load. Default is unigradicon. Choose from [unigradicon, multigradicon].")
+    parser.add_argument("--fixed_segmentation", required=False,
+                         type=str, help="The path of the mask of the fixed image. \
+                         This segmentation will be used for the instance optimization registration.")
+    parser.add_argument("--moving_segmentation", required=False,
+                         type=str, help="The path of the mask of the moving image. \
+                         This segmentation will be used for the instance optimization registration.")
 
     args = parser.parse_args()
 
@@ -345,6 +352,21 @@ def main():
     fixed = itk.imread(args.fixed)
     moving = itk.imread(args.moving)
     
+    if args.fixed_mask is not None:
+        fixed_mask = itk.imread(args.fixed_mask)
+    else:
+        fixed_mask = None
+    
+    if args.moving_mask is not None:
+        moving_mask = itk.imread(args.moving_mask)
+    else:
+        moving_mask = None
+
+    if args.io_iterations == "None":
+        io_iterations = None
+    else:
+        io_iterations = int(args.io_iterations)
+
     if args.fixed_segmentation is not None:
         fixed_segmentation = itk.imread(args.fixed_segmentation)
     else:
@@ -355,15 +377,12 @@ def main():
     else:
         moving_segmentation = None
 
-    if args.io_iterations == "None":
-        io_iterations = None
-    else:
-        io_iterations = int(args.io_iterations)
-
-    phi_AB, phi_BA = icon_registration.itk_wrapper.register_pair(
+    phi_AB, phi_BA = unigradicon.itk_wrapper.register_pair(
         net,
-        preprocess(moving, args.moving_modality, moving_segmentation), 
-        preprocess(fixed, args.fixed_modality, fixed_segmentation), 
+        preprocess(moving, args.moving_modality, moving_mask), 
+        preprocess(fixed, args.fixed_modality, fixed_mask),
+        seg_A=moving_segmentation,
+        seg_B=fixed_segmentation,
         finetune_steps=io_iterations)
 
     itk.transformwrite([phi_AB], args.transform_out)
