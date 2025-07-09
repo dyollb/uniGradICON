@@ -1,9 +1,6 @@
 import itk
-import os
 from collections import namedtuple
-from datetime import datetime
 
-import footsteps
 import numpy as np
 import torch
 
